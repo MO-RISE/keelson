@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+
+import json
+import time
+import atexit
+import logging
+import pathlib
+import warnings
+import argparse
+from queue import Queue, Empty
+from threading import Thread, Event
+from typing import Dict, Tuple
+from contextlib import contextmanager
+
+import struct
+from typing import BinaryIO, Generator
+
+import zenoh
+
+from brefv import TopicEnvelopePair
+
+logger = logging.getLogger("klog")
+
+@contextmanager
+def ignore(*exceptions):
+    try:
+        yield
+    except exceptions:
+        logger.exception("Something went wrong in the listener!")
+
+
+def write(writer: BinaryIO, topic: str, envelope: bytes) -> bytes:
+    logger.debug("Inserting envelope at topic %s into TopicEnvelopePair", topic)
+    pair = TopicEnvelopePair()
+    pair.topic = topic
+    pair.envelope = envelope
+    serialized_pair = pair.SerializeToString()
+
+    len_bytes = struct.pack(">Q", len(serialized_pair))
+
+    logger.debug("Serialized to length: %d", len_bytes)
+
+    writer.write(len_bytes + serialized_pair)
+
+
+def read(reader: BinaryIO) -> Generator[Tuple[str, bytes], None, None]:
+    while True:
+        length_bytes = reader.read(8) # Number of bytes for Q (unsigned long long)
+
+        # EOF
+        if not length_bytes:
+            return
+        
+        bytes_to_read, = struct.unpack(">Q", length_bytes)
+
+        pair_bytes = reader.read(bytes_to_read)
+
+        if len(pair_bytes) != bytes_to_read:
+            warnings.warn("Requested number of bytes to read did not match what we got... reading no further!")
+            return
+        
+        pair = TopicEnvelopePair()
+        pair.ParseFromString(pair_bytes)
+
+        yield pair.topic, pair.envelope
+
+
+def record(session: zenoh.Session, args: argparse.Namespace):
+    queue = Queue()
+
+    close_down = Event()
+
+    def _recorder():
+
+        with args.output.open("ab") as writer:
+            while not close_down.is_set():
+                try:
+                    sample: zenoh.Sample = queue.get(timeout=0.01)
+                except Empty:
+                    continue
+
+                with ignore(Exception):
+                    topic = str(sample.key_expr)
+                    envelope = sample.value.payload
+                    logger.debug("Received sample on topic: %s", topic)
+
+                    write(writer, topic, envelope)
+
+    t = Thread(target=_recorder)
+    t.daemon = True
+    t.start()
+
+    # And start subscribing
+    subscribers = [session.declare_subscriber(key, queue.put) for key in args.key]
+
+    while True:
+        try:
+            qsize = queue.qsize()
+            logger.debug("Approximate queue size is: %s", qsize)
+
+            if qsize > 100:
+                warnings.warn("Queue size is %s", qsize)
+            elif qsize > 1000:
+                raise RuntimeError(
+                    f"Recorder is not capable of keeping up with data flow. Current queue size is {qsize}. Exiting!"
+                )
+            
+            time.sleep(1.0)
+        except KeyboardInterrupt:
+            logger.info("Closing down on user request!")
+            logger.debug("Undeclaring subscribers...")
+            for sub in subscribers:
+                sub.undeclare()
+
+            logger.debug("Waiting for all items in queue to be processed...")
+            while not queue.empty():
+                time.sleep(0.1)
+
+            logger.debug("Joining recorder thread...")
+            close_down.set()
+            t.join()
+
+            logger.debug("Done! Good bye :)")
+            break
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="record",
+        description="A pure python mcap recorder for keelson",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument("--log-level", type=int, default=logging.INFO)
+
+    parser.add_argument(
+        "-k",
+        "--key",
+        type=str,
+        action="append",
+        required=True,
+        help="Key expressions to subscribe to from the Zenoh session",
+    )
+
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=pathlib.Path,
+        required=True,
+        help="File path to write recording to",
+    )
+
+    ## Parse arguments and start doing our thing
+    args = parser.parse_args()
+
+    # Setup logger
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s %(name)s %(message)s", level=args.log_level
+    )
+    logging.captureWarnings(True)
+    zenoh.init_logger()
+
+    # Put together zenoh session configuration
+    conf = zenoh.Config()
+    conf.insert_json5(zenoh.config.MODE_KEY, json.dumps("peer"))
+
+    ## Construct session
+    logger.info("Opening Zenoh session...")
+    session = zenoh.open(conf)
+
+    def _on_exit():
+        session.close()
+
+    atexit.register(_on_exit)
+
+    run(session, args)
+
+
+if __name__ == "__main__":
+    main()

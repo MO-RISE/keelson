@@ -13,11 +13,14 @@ message Envelope {
     bytes payload = 2;
 }
 
-message TopicEnvelopePair {
+message KLoggedEnvelope {
+
+    // Log time of the envelope
+    google.protobuf.Timestamp log_time = 1;
 
     // Topic associated with the envelope
-    string topic = 1;
+    string topic = 2;
 
     // The envelope
-    bytes envelope = 2;
+    bytes envelope = 3;
 }
